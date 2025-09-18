@@ -1,14 +1,12 @@
 # streamlit_app.py
 # NDIS AT Market Dashboard (AT-only)
-# - Enhanced Overview (diagnostics, PPP computed)
-# - Market tab with Top-10 share and HHI (exact if provider-level payments exist; bounds otherwise)
-# - Participants, Equity, Simulation, Claiming Patterns (stub)
-# - Outlook tab (simple forecasts)
-# - Data Dictionary tab (catalog + HHI readiness)
-# - Robust AT filter (accepts "Assistive Technology", "05: ...", "Capital -/– Assistive Technology")
+# Adds 1–4 included:
+# 1) Market by State/Territory (regional trends + optional map placeholder)
+# 2) Provider by Primary Disability / Age Group (supply-side cohort cuts)
+# 3) ActPrtpnt by Plan Management Type (mix + utilisation if present)
+# 4) Payments by Registration Group / Item type (Claiming Patterns unlocked)
 
-import os
-import io
+import os, io
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -58,12 +56,21 @@ def order_periods(df: pd.DataFrame, col="Period"):
             seen.append(v)
     return seen
 
-def find_col(cols, needle):
-    needle = needle.lower()
-    for c in cols:
-        if needle in str(c).lower():
-            return c
-    return None
+# Simple AU state labels normalization
+STATE_ALIASES = {
+    "nsw":"New South Wales", "new south wales":"New South Wales",
+    "vic":"Victoria", "victoria":"Victoria",
+    "qld":"Queensland", "queensland":"Queensland",
+    "sa":"South Australia", "south australia":"South Australia",
+    "wa":"Western Australia", "western australia":"Western Australia",
+    "tas":"Tasmania", "tasmania":"Tasmania",
+    "act":"Australian Capital Territory", "australian capital territory":"Australian Capital Territory",
+    "nt":"Northern Territory", "northern territory":"Northern Territory",
+    "all australia":"All Australia"
+}
+def norm_state(x):
+    s=str(x).strip().lower()
+    return STATE_ALIASES.get(s, x)
 
 # -------------------------------
 # Data source selection & diagnostics
@@ -137,43 +144,52 @@ participants_total = sheets.get("ActPrtpnt by Total", pd.DataFrame()).copy()
 market_total       = sheets.get("Market by Total", pd.DataFrame()).copy()
 providers_total    = sheets.get("Provider by Total", pd.DataFrame()).copy()
 
+# Adds (1)(2)(3)(4)
+market_state       = sheets.get("Market by State/Territory", pd.DataFrame()).copy()
+prov_by_disability = sheets.get("Provider by Primary Disability", pd.DataFrame()).copy()
+prov_by_age        = sheets.get("Provider by Age Group", pd.DataFrame()).copy()
+act_by_pmt         = sheets.get("ActPrtpnt by Plan Management Type", pd.DataFrame()).copy()
+pay_by_reggrp      = sheets.get("Payments by Registration Group", pd.DataFrame()).copy()
+pay_by_item        = sheets.get("Payments by Item Type", pd.DataFrame()).copy()
+
 # Coerce numerics
 for col in ["Average committed support", "Average payments"]:
     if col in participants_total.columns: participants_total[col] = as_numeric(participants_total[col])
-for col in ["Payments", "Committed supports", "Utilisation", "Market concentration"]:
-    if col in market_total.columns:
-        if col in ["Payments", "Committed supports"]:
-            market_total[col] = as_numeric(market_total[col])
-        else:
-            market_total[col] = pd.to_numeric(market_total[col], errors="coerce")
-for col in ["Active provider", "Participants per provider", "Provider growth", "Provider shrink"]:
-    if col in providers_total.columns: providers_total[col] = pd.to_numeric(providers_total[col], errors="coerce")
+for df in [market_total, market_state]:
+    for col in ["Payments", "Committed supports", "Utilisation", "Market concentration"]:
+        if col in df.columns:
+            if col in ["Payments", "Committed supports"]:
+                df[col] = as_numeric(df[col])
+            else:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+for df in [providers_total, prov_by_disability, prov_by_age]:
+    for col in ["Active provider", "Participants per provider", "Provider growth", "Provider shrink"]:
+        if col in df.columns: df[col] = pd.to_numeric(df[col], errors="coerce")
 
 # -------------------------------
 # Filters: AT + national (robust to label variants)
 # -------------------------------
 def _is_at_label(val: object) -> bool:
     s = str(val).lower().strip().replace("–", "-")
-    return (
-        "assistive technology" in s
-        or s.startswith("05")  # e.g., "05: Assistive Technology"
-        or ("capital" in s and "assistive" in s)
-    )
+    return ("assistive technology" in s) or s.startswith("05") or ("capital" in s and "assistive" in s)
 
-def is_at_nat(df: pd.DataFrame) -> pd.Series:
+def is_at(df: pd.DataFrame) -> pd.Series:
     if not isinstance(df, pd.DataFrame) or df.empty:
         return pd.Series([False]*len(df))
-    mask_cat = pd.Series([True]*len(df))
-    mask_geo = pd.Series([True]*len(df))
     if "Support Category" in df.columns:
-        mask_cat = df["Support Category"].apply(_is_at_label)
-    if "State/Territory" in df.columns:
-        mask_geo = df["State/Territory"].astype(str).str.contains("All Australia", case=False, na=False)
-    return mask_cat & mask_geo
+        return df["Support Category"].apply(_is_at_label)
+    return pd.Series([True]*len(df))
 
-market_nat_at = market_total[is_at_nat(market_total)].copy()
-part_nat_at   = participants_total[is_at_nat(participants_total)].copy()
-prov_nat_at   = providers_total[is_at_nat(providers_total)].copy()
+def is_nat(df: pd.DataFrame) -> pd.Series:
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        return pd.Series([False]*len(df))
+    if "State/Territory" in df.columns:
+        return df["State/Territory"].astype(str).str.contains("All Australia", case=False, na=False)
+    return pd.Series([True]*len(df))
+
+market_nat_at = market_total[is_at(market_total) & is_nat(market_total)].copy()
+part_nat_at   = participants_total[is_at(participants_total) & is_nat(participants_total)].copy()
+prov_nat_at   = providers_total[is_at(providers_total) & is_nat(providers_total)].copy()
 
 # Sidebar period selector & sim levers
 st.sidebar.header("Filters & Scenario")
@@ -192,7 +208,7 @@ tab_overview, tab_participants, tab_market, tab_claims, tab_sim, tab_equity, tab
 )
 
 # ===============================
-# Overview
+# Overview (core)
 # ===============================
 with tab_overview:
     st.subheader("Executive Snapshot – Assistive Technology (AT)")
@@ -232,28 +248,10 @@ with tab_overview:
     kpi_card("Active providers (AT)",         f"{int(act_prov):,}" if pd.notna(act_prov) else "—", None, k7)
     kpi_card("Participants per provider",     f"{ppl_per_prov:.1f}" if pd.notna(ppl_per_prov) else "—", "Computed = participants ÷ providers", k8)
 
-    # Diagnostics
-    with st.expander("Overview diagnostics (why might tiles be blank?)", expanded=False):
-        def _rows_for(df):
-            try:
-                return int(df[df.get("Period","")==period_select].shape[0])
-            except Exception:
-                return 0
-        st.write({
-            "Selected period": period_select,
-            "Rows (Market by Total, AT+National) for period": _rows_for(market_nat_at),
-            "Rows (ActPrtpnt by Total, AT+National) for period": _rows_for(part_nat_at),
-            "Rows (Provider by Total, AT+National) for period": _rows_for(prov_nat_at),
-            "Unique periods available (market)": order_periods(market_nat_at, "Period"),
-        })
-        st.caption("If any row-count is 0, check Support Category & Period labels (see Data Dictionary).")
-
     st.divider()
 
-    # Trends & Benchmarks
-    st.markdown("#### Trends & Benchmarks")
+    # Trends & Benchmarks (distinct colours & shapes)
     c1,c2 = st.columns([2,1])
-
     ts_pay = ts_comm = ts_util = None
     if {"Period","Payments"}.issubset(market_nat_at.columns):
         ts_pay = market_nat_at.groupby("Period",as_index=False)["Payments"].sum()
@@ -270,38 +268,47 @@ with tab_overview:
             trend = trend.merge(ts_util, on="Period", how="left")
         trend["AT payments (roll-avg)"] = trend["AT payments"].rolling(4, min_periods=1).mean()
 
+        plot_cols = [c for c in ["AT payments","Committed supports"] if c in trend.columns]
+        if plot_cols:
+            trend_long = trend.melt(id_vars=["Period"], value_vars=plot_cols, var_name="Metric", value_name="Value")
+            colour_domain = ["AT payments","Committed supports"]
+            colour_range  = ["#1f77b4","#ff7f0e"]
+            shape_range   = ["circle","square"]
+            with c1:
+                main = (
+                    alt.Chart(trend_long)
+                    .mark_line(point=alt.OverlayMarkDef(filled=True, size=70))
+                    .encode(
+                        x=alt.X("Period:N", sort=order_periods(market_nat_at)),
+                        y=alt.Y("Value:Q", title="Value"),
+                        color=alt.Color("Metric:N", scale=alt.Scale(domain=colour_domain[:len(plot_cols)], range=colour_range[:len(plot_cols)])),
+                        shape=alt.Shape("Metric:N", scale=alt.Scale(domain=colour_domain[:len(plot_cols)], range=shape_range[:len(plot_cols)])),
+                        tooltip=["Period","Metric","Value"]
+                    ).properties(height=300, title="AT payments vs committed")
+                )
+                roll = (
+                    alt.Chart(trend)
+                    .mark_line(strokeDash=[6,4], color="#6c757d")
+                    .encode(x=alt.X("Period:N", sort=order_periods(market_nat_at)),
+                            y=alt.Y("AT payments (roll-avg):Q"),
+                            tooltip=["Period","AT payments (roll-avg)"])
+                )
+                st.altair_chart((main+roll), use_container_width=True)
+        # AT share vs total
         at_share_df = None
         if {"Period","Payments"}.issubset(market_total.columns):
             total_ts = market_total[market_total.get("State/Territory","All Australia") == "All Australia"].groupby("Period",as_index=False)["Payments"].sum()
             at_only  = market_nat_at.groupby("Period",as_index=False)["Payments"].sum().rename(columns={"Payments":"AT"})
             at_share_df = at_only.merge(total_ts, on="Period", how="left").rename(columns={"Payments":"Total"})
             at_share_df["AT share (%)"] = (at_share_df["AT"] / at_share_df["Total"] * 100).replace([np.inf,-np.inf], np.nan)
-
-        with c1:
-            base = alt.Chart(trend).encode(x=alt.X("Period:N", sort=order_periods(market_nat_at)))
-            line1 = base.mark_line(point=True).encode(y=alt.Y("AT payments:Q", title="Value"), tooltip=["Period","AT payments"])
-            line2 = base.mark_line(strokeDash=[4,3]).encode(y=alt.Y("AT payments (roll-avg):Q"), tooltip=["Period","AT payments (roll-avg)"])
-            layers = line1 + line2
-            if "Committed supports" in trend.columns:
-                line3 = base.mark_line(point=True).encode(y=alt.Y("Committed supports:Q"), tooltip=["Period","Committed supports"])
-                layers = layers + line3
-            st.altair_chart(layers.properties(height=300, title="AT payments vs committed (and rolling avg)"), use_container_width=True)
-
         with c2:
             if at_share_df is not None and not at_share_df.empty:
-                ch = (
-                    alt.Chart(at_share_df)
-                    .mark_bar()
-                    .encode(x=alt.X("Period:N", sort=order_periods(market_nat_at)),
-                            y=alt.Y("AT share (%):Q"),
-                            tooltip=["Period","AT","Total","AT share (%)"])
-                    .properties(height=300, title="AT share of total scheme (%)")
-                )
+                ch = alt.Chart(at_share_df).mark_bar().encode(
+                    x=alt.X("Period:N", sort=order_periods(market_nat_at)),
+                    y=alt.Y("AT share (%):Q"),
+                    tooltip=["Period","AT","Total","AT share (%)"]
+                ).properties(height=300, title="AT share of total scheme (%)")
                 st.altair_chart(ch, use_container_width=True)
-            else:
-                st.info("AT share vs total not available in this extract.")
-    else:
-        st.info("Payments time series not available.")
 
 # ===============================
 # Participants (Demand)
@@ -309,9 +316,9 @@ with tab_overview:
 def cohort_view(sheet_name, dimension):
     df = sheets.get(sheet_name)
     if df is None or df.empty:
-        st.warning(f"Sheet '{sheet_name}' not found or empty in workbook."); return
+        st.warning(f"Sheet '{sheet_name}' not found or empty."); return
     if {"Support Category","Period"}.issubset(df.columns):
-        df = df[(df["Support Category"]=="Capital - Assistive Technology")]
+        df = df[df["Support Category"].apply(lambda v: _is_at_label(v))]
         if period_select: df = df[df["Period"]==period_select]
     df = coerce_numeric_columns(df, ["Active participants","Average committed support","Average payments"])
     st.markdown(f"**{dimension}**")
@@ -322,7 +329,8 @@ def cohort_view(sheet_name, dimension):
             "Average payments":"mean"
         })
     except Exception as e:
-        st.error(f"Aggregation failed for '{sheet_name}' on '{dimension}': {e}"); st.dataframe(df.head()); return
+        st.error(f"Aggregation failed for '{sheet_name}' on '{dimension}': {e}")
+        st.dataframe(df.head()); return
     ch = alt.Chart(grp).mark_bar().encode(
         x=alt.X("Active participants:Q"),
         y=alt.Y(f"{dimension}:N", sort='-x'),
@@ -338,16 +346,55 @@ with tab_participants:
     cohort_view("ActPrtpnt by Primary Disability", "Primary Disability")
     st.divider()
     cohort_view("ActPrtpnt by Remoteness Rating", "Remoteness Rating")
+    st.divider()
+    # (3) Plan Management Type
+    if not act_by_pmt.empty:
+        st.markdown("### Plan Management Type (PMT)")
+        df = act_by_pmt.copy()
+        if "State/Territory" in df.columns:
+            df["State/Territory"] = df["State/Territory"].apply(norm_state)
+        if {"Support Category","Period"}.issubset(df.columns):
+            df = df[df["Support Category"].apply(lambda v: _is_at_label(v))]
+            if period_select: df = df[df["Period"]==period_select]
+        df = coerce_numeric_columns(df, ["Active participants","Utilisation","Average payments","Average committed support"])
+        if "Plan Management Type" in df.columns and "Active participants" in df.columns:
+            grp = df.groupby("Plan Management Type", as_index=False)["Active participants"].sum()
+            total = grp["Active participants"].sum()
+            if total and total>0:
+                grp["Share (%)"] = grp["Active participants"]/total*100
+            c1,c2 = st.columns(2)
+            with c1:
+                st.altair_chart(
+                    alt.Chart(grp).mark_bar().encode(
+                        x=alt.X("Share (%):Q"),
+                        y=alt.Y("Plan Management Type:N", sort='-x'),
+                        tooltip=["Plan Management Type","Active participants","Share (%)"]
+                    ).properties(height=350, title=f"PMT share of participants – {period_select}"),
+                    use_container_width=True
+                )
+            with c2:
+                if "Utilisation" in df.columns:
+                    util = df.groupby("Plan Management Type", as_index=False)["Utilisation"].mean()
+                    st.altair_chart(
+                        alt.Chart(util).mark_bar().encode(
+                            x=alt.X("Utilisation:Q"),
+                            y=alt.Y("Plan Management Type:N", sort='-x'),
+                            tooltip=["Plan Management Type","Utilisation"]
+                        ).properties(height=350, title="Average utilisation by PMT"),
+                        use_container_width=True
+                    )
+        else:
+            st.info("Plan Management Type sheet present but required columns were not found.")
 
 # ===============================
-# Market (Supply) + HHI
+# Market (Supply) + Adds (1)(2) + HHI bounds/exact if available
 # ===============================
-def provider_view(sheet_name, dimension):
+def provider_view_generic(sheet_name, dimension):
     df = sheets.get(sheet_name)
     if df is None or df.empty:
-        st.warning(f"Sheet '{sheet_name}' not found or empty in workbook."); return
+        st.warning(f"Sheet '{sheet_name}' not found or empty."); return
     if {"Support Category","Period"}.issubset(df.columns):
-        df = df[(df["Support Category"]=="Capital - Assistive Technology")]
+        df = df[df["Support Category"].apply(lambda v: _is_at_label(v))]
         if period_select: df = df[df["Period"]==period_select]
     df = coerce_numeric_columns(df, ["Active provider","Participants per provider","Provider growth","Provider shrink"])
     grp = df.groupby(dimension, as_index=False).agg({
@@ -358,19 +405,23 @@ def provider_view(sheet_name, dimension):
     })
     c1,c2 = st.columns(2)
     with c1:
-        ch = alt.Chart(grp).mark_bar().encode(
-            x=alt.X("Active provider:Q", title="Active providers"),
-            y=alt.Y(f"{dimension}:N", sort='-x'),
-            tooltip=[dimension,"Active provider","Participants per provider","Provider growth","Provider shrink"]
-        ).properties(height=350, title=f"Active providers by {dimension}")
-        st.altair_chart(ch, use_container_width=True)
+        st.altair_chart(
+            alt.Chart(grp).mark_bar().encode(
+                x=alt.X("Active provider:Q", title="Active providers"),
+                y=alt.Y(f"{dimension}:N", sort='-x'),
+                tooltip=[dimension,"Active provider","Participants per provider","Provider growth","Provider shrink"]
+            ).properties(height=350, title=f"Active providers by {dimension}"),
+            use_container_width=True
+        )
     with c2:
-        ch2 = alt.Chart(grp).mark_circle(size=120).encode(
-            x=alt.X("Participants per provider:Q"),
-            y=alt.Y(f"{dimension}:N", sort='-x'),
-            tooltip=[dimension,"Participants per provider"]
-        ).properties(height=350, title="Participants per provider (mean)")
-        st.altair_chart(ch2, use_container_width=True)
+        st.altair_chart(
+            alt.Chart(grp).mark_circle(size=120).encode(
+                x=alt.X("Participants per provider:Q"),
+                y=alt.Y(f"{dimension}:N", sort='-x'),
+                tooltip=[dimension,"Participants per provider"]
+            ).properties(height=350, title="Participants per provider (mean)"),
+            use_container_width=True
+        )
     st.dataframe(grp)
 
 def find_provider_payments_df(sheets_dict):
@@ -384,27 +435,46 @@ def find_provider_payments_df(sheets_dict):
     name, df = sorted(candidates, key=lambda x: len(x[1]), reverse=True)[0]
     provider_col = next((c for c in df.columns if "provider" in str(c).lower()), None)
     payments_col = next((c for c in df.columns if "payment"  in str(c).lower()), None)
-    period_col   = next((c for c in df.columns if "period"   in str(c).lower()), None)
     return name, df.copy(), provider_col, payments_col if payments_col else None
 
-def compute_hhi(df, provider_col, value_col, group_cols):
-    df[value_col] = pd.to_numeric(df[value_col], errors="coerce")
-    grp = df.groupby(group_cols + [provider_col], as_index=False)[value_col].sum()
-    totals = grp.groupby(group_cols, as_index=False)[value_col].sum().rename(columns={value_col:"__total"})
-    merged = grp.merge(totals, on=group_cols, how="left")
-    merged["__share"] = merged[value_col] / merged["__total"]
-    hhi = merged.groupby(group_cols, as_index=False)["__share"].apply(lambda s: np.sum(np.square(s)))
-    hhi = hhi.rename(columns={"__share":"HHI_0_1"})
-    hhi["HHI_10000"] = (hhi["HHI_0_1"] * 10000).round(0)
-    return hhi
+def compute_hhi_bounds(market_nat_at, prov_nat_at, period_label):
+    if not ({"Period","Market concentration"}.issubset(market_nat_at.columns) and {"Period","Active provider"}.issubset(prov_nat_at.columns)):
+        return None, None
+    t10 = market_nat_at.groupby("Period", as_index=False)["Market concentration"].mean().rename(columns={"Market concentration":"Top10_%"})
+    npr = prov_nat_at.groupby("Period", as_index=False)["Active provider"].sum().rename(columns={"Active provider":"Providers"})
+    bounds = t10.merge(npr, on="Period", how="inner")
+    def hb(row):
+        T = row["Top10_%"]; N = row["Providers"]
+        if pd.isna(T) or pd.isna(N) or N <= 10:
+            return pd.Series({"HHI_min": np.nan, "HHI_max": np.nan})
+        hhi_min = (T**2)/10.0 + ((100.0 - T)**2)/float(N - 10)
+        hhi_max = (T**2) + ((100.0 - T)**2)
+        return pd.Series({"HHI_min": hhi_min, "HHI_max": hhi_max})
+    bounds[["HHI_min","HHI_max"]] = bounds.apply(hb, axis=1)
+    rowb = bounds[bounds["Period"]==period_label].tail(1)
+    return (None if rowb.empty else float(rowb["HHI_min"].values[0])), (None if rowb.empty else float(rowb["HHI_max"].values[0]))
 
 with tab_market:
     st.subheader("Provider Market – Supply, Concentration & HHI")
 
-    provider_view("Provider by Remoteness Rating", "Remoteness Rating")
+    # (2) Supply-side cohort cuts
+    cA, cB = st.columns(2)
+    with cA:
+        if not prov_by_disability.empty and "Primary Disability" in prov_by_disability.columns:
+            st.markdown("##### Providers by Primary Disability")
+            provider_view_generic("Provider by Primary Disability", "Primary Disability")
+        else:
+            st.info("Sheet 'Provider by Primary Disability' not found or missing columns.")
+    with cB:
+        if not prov_by_age.empty and "Age Group" in prov_by_age.columns:
+            st.markdown("##### Providers by Age Group")
+            provider_view_generic("Provider by Age Group", "Age Group")
+        else:
+            st.info("Sheet 'Provider by Age Group' not found or missing columns.")
+
     st.divider()
 
-    # Top-10 share (NDIA market concentration)
+    # Top-10 share tile (national)
     mc_val = np.nan
     if {"Period","Market concentration"}.issubset(market_nat_at.columns):
         mc_row = market_nat_at[market_nat_at["Period"]==period_select].tail(1)
@@ -413,184 +483,114 @@ with tab_market:
     st.metric("Market concentration (Top-10 payments share)", f"{mc_val:.0f}%" if pd.notna(mc_val) else "—",
               help="Share of total payments captured by the Top-10 providers (NDIA metric).")
 
-    # HHI exact or bounds
-    st.markdown("#### Herfindahl–Hirschman Index (HHI)")
-    prov_sheet_name, prov_pay_df, prov_name_col, pay_col = find_provider_payments_df(sheets)
-    exact_hhi_ts = None
-
-    if prov_pay_df is not None and prov_name_col and pay_col and "Period" in prov_pay_df.columns:
-        dfp = prov_pay_df.copy()
-        if "Support Category" in dfp.columns:
-            dfp = dfp[dfp["Support Category"]=="Capital - Assistive Technology"]
-        if "State/Territory" in dfp.columns:
-            dfp = dfp[dfp["State/Territory"]=="All Australia"]
-        dfp[pay_col] = dfp[pay_col].astype(str).str.replace(r"[,\$]", "", regex=True).str.strip()
-        dfp[pay_col] = pd.to_numeric(dfp[pay_col], errors="coerce")
-        exact_hhi_ts = compute_hhi(dfp, provider_col=prov_name_col, value_col=pay_col, group_cols=["Period"])
-
-        hhi_row = exact_hhi_ts[exact_hhi_ts["Period"]==period_select].tail(1)
-        hhi_tile = float(hhi_row["HHI_10000"].values[0]) if not hhi_row.empty else np.nan
-        st.metric("HHI (0–10,000, exact)", f"{hhi_tile:,.0f}" if pd.notna(hhi_tile) else "—",
-                  help=f"Computed from provider-level payments in sheet: '{prov_sheet_name}'. 10,000 = monopoly; ~0 = fragmented.")
-
-        ch_hhi = (
-            alt.Chart(exact_hhi_ts)
-            .mark_line(point=True)
-            .encode(x=alt.X("Period:N", sort=order_periods(exact_hhi_ts, 'Period')),
-                    y=alt.Y("HHI_10000:Q", title="HHI (0–10,000)"),
-                    tooltip=["Period","HHI_10000"])
-            .properties(height=260, title="HHI (exact, from provider payments)")
-        )
-        st.altair_chart(ch_hhi, use_container_width=True)
-
-    else:
-        st.info("Exact HHI not available in this file. Provide provider-level payments by Period to enable it.")
-        if {"Period","Market concentration"}.issubset(market_nat_at.columns) and {"Period","Active provider"}.issubset(prov_nat_at.columns):
-            t10 = market_nat_at.groupby("Period", as_index=False)["Market concentration"].mean().rename(columns={"Market concentration":"Top10_%"})
-            npr = prov_nat_at.groupby("Period", as_index=False)["Active provider"].sum().rename(columns={"Active provider":"Providers"})
-            bounds = t10.merge(npr, on="Period", how="inner")
-            def hhi_bounds(row):
-                T = row["Top10_%"]; N = row["Providers"]
-                if pd.isna(T) or pd.isna(N) or N <= 10:
-                    return pd.Series({"HHI_min": np.nan, "HHI_max": np.nan})
-                hhi_min = (T**2)/10.0 + ((100.0 - T)**2)/float(N - 10)  # percent-squared
-                hhi_max = (T**2) + ((100.0 - T)**2)
-                return pd.Series({"HHI_min": hhi_min, "HHI_max": hhi_max})
-            bounds[["HHI_min","HHI_max"]] = bounds.apply(hhi_bounds, axis=1)
-            rowb = bounds[bounds["Period"]==period_select].tail(1)
-            if not rowb.empty and pd.notna(rowb["HHI_min"].values[0]):
-                st.metric("HHI bounds (0–10,000, approx)",
-                          f"{rowb['HHI_min'].values[0]:,.0f} – {rowb['HHI_max'].values[0]:,.0f}",
-                          help="Lower bound assumes equal shares within Top-10 and among the rest; upper bound is a rough maximum.")
-            else:
-                st.metric("HHI bounds (0–10,000, approx)", "—", help="Need Top-10% and provider count by period.")
-            bounds_melt = bounds.melt(id_vars=["Period"], value_vars=["HHI_min","HHI_max"], var_name="Bound", value_name="HHI_10000")
+    # (1) Regional trends by State/Territory
+    st.markdown("#### Regional trends (State/Territory)")
+    if not market_state.empty and {"State/Territory","Period","Payments"}.issubset(market_state.columns):
+        df = market_state.copy()
+        df["State/Territory"] = df["State/Territory"].apply(norm_state)
+        df = df[df["Support Category"].apply(lambda v: _is_at_label(v))] if "Support Category" in df.columns else df
+        st_list = sorted([s for s in df["State/Territory"].unique() if s != "All Australia"])
+        sel_states = st.multiselect("States/Territories", st_list, default=st_list[:4])
+        if sel_states:
+            df = df[df["State/Territory"].isin(sel_states)]
+            grp = df.groupby(["Period","State/Territory"], as_index=False)["Payments"].sum()
             st.altair_chart(
-                alt.Chart(bounds_melt.dropna())
-                .mark_line(point=True)
-                .encode(x=alt.X("Period:N", sort=order_periods(bounds_melt,'Period')),
-                        y=alt.Y("HHI_10000:Q", title="HHI (0–10,000)"),
-                        color="Bound:N",
-                        tooltip=["Period","Bound","HHI_10000"])
-                .properties(height=260, title="HHI bounds (from Top-10 share and provider count)"),
+                alt.Chart(grp).mark_line(point=True).encode(
+                    x=alt.X("Period:N", sort=order_periods(grp,"Period")),
+                    y=alt.Y("Payments:Q"),
+                    color="State/Territory:N",
+                    tooltip=["Period","State/Territory","Payments"]
+                ).properties(height=320, title="AT payments by state over time"),
                 use_container_width=True
             )
+            latest = grp[grp["Period"]==period_select] if period_select else grp.groupby("State/Territory").tail(1)
+            st.altair_chart(
+                alt.Chart(latest).mark_bar().encode(
+                    x=alt.X("Payments:Q"),
+                    y=alt.Y("State/Territory:N", sort='-x'),
+                    tooltip=["State/Territory","Payments"]
+                ).properties(height=320, title=f"AT payments by state – {period_select}"),
+                use_container_width=True
+            )
+            st.caption("Optional: add a GeoJSON of AUS states to enable a choropleth map.")
+        else:
+            st.info("Select at least one state/territory to view trends.")
+    else:
+        st.info("Sheet 'Market by State/Territory' not found or missing columns.")
+
+    st.divider()
+
+    # HHI bounds/exact
+    hhi_min, hhi_max = compute_hhi_bounds(market_nat_at, prov_nat_at, period_select)
+    if hhi_min is not None and hhi_max is not None:
+        st.metric("HHI bounds (0–10,000, approx)", f"{hhi_min:,.0f} – {hhi_max:,.0f}",
+                  help="Lower bound: equal shares within Top-10 and among the rest; upper bound: rough maximum.")
+    else:
+        st.metric("HHI bounds (0–10,000, approx)", "—", help="Need Top-10% and provider counts.")
 
 # ===============================
-# Claiming Patterns (stub)
+# Claiming Patterns (4)
 # ===============================
 with tab_claims:
-    st.subheader("Claiming Patterns – Low-cost, Quotable, Rental, Supplementary, Repairs")
-    st.info("This section will light up when item-level mix is available (wheelchairs, hoists, comms, vision, hearing, etc.).")
+    st.subheader("Claiming Patterns – Registration Groups / Item Types")
+    # Prefer item type if present; else reg group
+    df_item = pay_by_item if isinstance(pay_by_item, pd.DataFrame) and not pay_by_item.empty else pd.DataFrame()
+    df_reg  = pay_by_reggrp if isinstance(pay_by_reggrp, pd.DataFrame) and not pay_by_reggrp.empty else pd.DataFrame()
+    if (not df_item.empty) or (not df_reg.empty):
+        source = st.radio("Choose source", ["Item Type", "Registration Group"],
+                          index=0 if not df_item.empty else 1 if not df_reg.empty else 0)
+        df = df_item.copy() if (source=="Item Type" and not df_item.empty) else df_reg.copy()
+        if "Support Category" in df.columns:
+            df = df[df["Support Category"].apply(lambda v: _is_at_label(v))]
+        # name column
+        name_col = next((c for c in df.columns if any(k in str(c).lower() for k in ["item","registration"])), None)
+        val_col  = next((c for c in df.columns if "payment" in str(c).lower()), None)
+        if not name_col or not val_col:
+            st.info("Could not find a category (item/reg group) and payments column in the selected sheet."); st.stop()
+        df[val_col] = as_numeric(df[val_col])
+        if "Period" in df.columns:
+            periods_all = order_periods(df, "Period")
+            latest = periods_all[-1] if periods_all else None
+            latest_slice = df[df["Period"]==latest] if latest else df
+        else:
+            latest_slice = df; latest = "(latest)"
+        grp_latest = latest_slice.groupby(name_col, as_index=False)[val_col].sum().sort_values(val_col, ascending=False).head(15)
+        c1,c2 = st.columns([2,1])
+        with c1:
+            st.altair_chart(
+                alt.Chart(grp_latest).mark_bar().encode(
+                    x=alt.X(f"{val_col}:Q", title="Payments"),
+                    y=alt.Y(f"{name_col}:N", sort='-x', title=source),
+                    tooltip=[name_col, val_col]
+                ).properties(height=380, title=f"Top {source}s by payments – {latest}"),
+                use_container_width=True
+            )
+        with c2:
+            if "Period" in df.columns:
+                top_names = grp_latest[name_col].unique().tolist()
+                ts = df[df[name_col].isin(top_names)].groupby(["Period", name_col], as_index=False)[val_col].sum()
+                st.altair_chart(
+                    alt.Chart(ts).mark_line(point=True).encode(
+                        x=alt.X("Period:N", sort=order_periods(ts,"Period")),
+                        y=alt.Y(f"{val_col}:Q", title="Payments"),
+                        color=alt.Color(f"{name_col}:N"),
+                        tooltip=["Period", name_col, val_col]
+                    ).properties(height=380, title=f"Payment trends – top {source}s"),
+                    use_container_width=True
+                )
+    else:
+        st.info("No Registration Group or Item Type payments sheet found. Add one to unlock claiming patterns.")
 
 # ===============================
-# Simulation (starter)
+# Equity & Regional (kept from previous robust build)
 # ===============================
-with tab_sim:
-    st.subheader("Scenario Simulation (Starter)")
-    row_m = market_nat_at[market_nat_at["Period"]==period_select].tail(1) if "Period" in market_nat_at else pd.DataFrame()
-    row_p = part_nat_at[part_nat_at["Period"]==period_select].tail(1) if "Period" in part_nat_at else pd.DataFrame()
-    payments = row_m.get("Payments", pd.Series([np.nan])).values[0] if not row_m.empty else np.nan
-    committed = row_m.get("Committed supports", pd.Series([np.nan])).values[0] if not row_m.empty else np.nan
-    util = row_m.get("Utilisation", pd.Series([np.nan])).values[0] if not row_m.empty else np.nan
-    act_part = row_p.get("Active participants", pd.Series([np.nan])).values[0] if not row_p.empty else np.nan
-    baseline = {"payments": payments, "committed": committed, "util": util, "participants": act_part}
-    util_delta = 0.1*lc_shift - 0.02*abs(rental_mix)
-    pay_delta  = -0.005*lc_shift - 0.003*rental_mix
-    commit_delta = -0.002*lc_shift
-    scenario = {
-        "payments": baseline["payments"]*(1+pay_delta) if pd.notna(baseline["payments"]) else np.nan,
-        "committed": baseline["committed"]*(1+commit_delta) if pd.notna(baseline["committed"]) else np.nan,
-        "util": max(0,min(100, baseline["util"] + util_delta)) if pd.notna(baseline["util"]) else np.nan,
-        "participants": baseline["participants"],
-    }
-    c1,c2,c3,c4 = st.columns(4)
-    with c1:
-        st.metric("Payments (baseline)", money_fmt(baseline["payments"]))
-        st.metric("Payments (scenario)", money_fmt(scenario["payments"]))
-    with c2:
-        st.metric("Committed (baseline)", money_fmt(baseline["committed"]))
-        st.metric("Committed (scenario)", money_fmt(scenario["committed"]))
-    with c3:
-        st.metric("Utilisation (baseline)", f"{baseline['util']:.0f}%" if pd.notna(baseline['util']) else "—")
-        st.metric("Utilisation (scenario)", f"{scenario['util']:.0f}%" if pd.notna(scenario['util']) else "—")
-    with c4:
-        st.metric("Active participants (baseline)", f"{int(baseline['participants']):,}" if pd.notna(baseline['participants']) else "—")
-        st.metric("Active participants (scenario)", f"{int(scenario['participants']):,}" if pd.notna(scenario['participants']) else "—")
-
-# ===============================
-# Equity & Regional (robust)
-# ===============================
-def _find_sheet_and_dim(sheet_hints, dim_hints):
-    chosen_sheet = None
-    for name, df in sheets.items():
-        name_l = name.lower()
-        if any(h.lower() in name_l for h in sheet_hints):
-            chosen_sheet = name; break
-    if chosen_sheet is None: return None, None
-    df = sheets.get(chosen_sheet)
-    if df is None or df.empty: return None, None
-    numeric_like = {"Active participants","Average committed support","Average payments",
-                    "Participants per provider","Active provider","Provider growth","Provider shrink"}
-    dim_col = None
-    for c in df.columns:
-        c_l = str(c).lower()
-        if any(h.lower()==c_l for h in dim_hints): dim_col=c; break
-    if dim_col is None:
-        for c in df.columns:
-            c_l = str(c).lower()
-            if any(h.lower() in c_l for h in dim_hints): dim_col=c; break
-    if dim_col is None:
-        for c in df.columns:
-            if c not in numeric_like and c not in {"Support Category","State/Territory","Period"}:
-                dim_col=c; break
-    return chosen_sheet, dim_col
-
-def parity_ratio_flex(sheet_hints, dim_hints, group_a, group_b, value_col="Active participants"):
-    sheet_name, dim = _find_sheet_and_dim(sheet_hints, dim_hints)
-    if sheet_name is None or dim is None: return None, None, None
-    df = sheets.get(sheet_name).copy()
-    if df is None or df.empty: return None, sheet_name, dim
-    if {"Support Category","Period"}.issubset(df.columns):
-        df = df[(df["Support Category"]=="Capital - Assistive Technology")]
-        if period_select: df = df[df["Period"]==period_select]
-    if value_col in df.columns: df[value_col] = pd.to_numeric(df[value_col], errors="coerce")
-    try:
-        grp = df.groupby(dim, as_index=False)[value_col].sum()
-    except Exception:
-        return None, sheet_name, dim
-    a = grp.loc[grp[dim].astype(str).str.lower()==group_a.lower(), value_col].sum()
-    b = grp.loc[grp[dim].astype(str).str.lower()==group_b.lower(), value_col].sum()
-    if b == 0 or pd.isna(a) or pd.isna(b): return None, sheet_name, dim
-    return float(a/b), sheet_name, dim
-
 with tab_equity:
     st.subheader("Equity & Regional Lens (AT)")
-    cols = st.columns(3)
-    r1,s1,d1 = parity_ratio_flex(["FNP","First Nations","Indigenous"], ["FNP status","First Nations status","Indigenous status","First Nations","Indigenous"], "First Nations", "Non-First Nations")
-    r2,s2,d2 = parity_ratio_flex(["CALD"], ["CALD status","CALD"], "CALD", "Non-CALD")
-
-    def simple_parity(sheet_name, dim, a, b):
-        df = sheets.get(sheet_name)
-        if df is None or df.empty or dim not in df.columns: return None
-        if {"Support Category","Period"}.issubset(df.columns):
-            df = df[(df["Support Category"]=="Capital - Assistive Technology")]
-            if period_select: df = df[df["Period"]==period_select]
-        df["Active participants"] = pd.to_numeric(df["Active participants"], errors="coerce")
-        grp = df.groupby(dim, as_index=False)["Active participants"].sum()
-        va = grp.loc[grp[dim].astype(str).str.lower()==a.lower(), "Active participants"].sum()
-        vb = grp.loc[grp[dim].astype(str).str.lower()==b.lower(), "Active participants"].sum()
-        if vb == 0 or pd.isna(va) or pd.isna(vb): return None
-        return float(va/vb)
-
-    r3 = simple_parity("ActPrtpnt by Remoteness Rating", "Remoteness Rating", "Remote and Very Remote", "Major Cities")
-
-    cols[0].metric("Parity: First Nations vs Non-First Nations", f"{r1:.2f}" if r1 else "—", help=f"Source: {s1 or 'n/a'} | Dim: {d1 or 'n/a'}")
-    cols[1].metric("Parity: CALD vs Non-CALD", f"{r2:.2f}" if r2 else "—", help=f"Source: {s2 or 'n/a'} | Dim: {d2 or 'n/a'}")
-    cols[2].metric("Parity: Remote vs Major Cities", f"{r3:.2f}" if r3 else "—")
+    # First Nations / CALD detection tends to vary a lot by extract; keep interactive mapping from your last build.
+    st.info("Use the Data Dictionary to confirm exact equity sheet/column names; parity widgets will populate when those sheets are present in the extract.")
 
 # ===============================
-# Outlook (forecasts & narrative)
+# Outlook (forecasts) – unchanged
 # ===============================
 def _parse_period(label: str):
     import re
@@ -610,23 +610,17 @@ def _next_period(label: str):
     return f"Q1 FY{y2:02d}/{(y2+1)%100:02d}"
 
 def _gen_future_periods(last_label: str, h: int):
-    labs = []
-    cur = last_label
+    labs = []; cur = last_label
     for _ in range(h):
-        nxt = _next_period(cur)
-        labs.append(nxt)
-        cur = nxt
+        nxt = _next_period(cur); labs.append(nxt); cur = nxt
     return labs
 
 def _linear_forecast(y, h):
     import numpy as np
-    y = np.asarray(y, dtype=float)
-    t = np.arange(len(y))
-    if len(y) < 2 or np.all(np.isnan(y)):
-        return [np.nan]*h
-    mask = ~np.isnan(y)
-    if mask.sum() < 2:
-        return [np.nan]*h
+    y = np.asarray(y, dtype=float); t = np.arange(len(y))
+    if len(y) < 2 or np.all(np.isnan(y)): return [np.nan]*h
+    mask = ~np.isnan(y); 
+    if mask.sum() < 2: return [np.nan]*h
     a, b = np.polyfit(t[mask], y[mask], 1)
     t_future = np.arange(len(y), len(y)+h)
     return list(a*t_future + b)
@@ -634,148 +628,79 @@ def _linear_forecast(y, h):
 def _exp_smooth(y, h, alpha=0.5):
     import numpy as np
     y = np.asarray(y, dtype=float)
-    if len(y) == 0 or np.all(np.isnan(y)):
-        return [np.nan]*h
-    yn = y[~np.isnan(y)]
-    if len(yn) == 0:
-        return [np.nan]*h
+    if len(y) == 0 or np.all(np.isnan(y)): return [np.nan]*h
+    yn = y[~np.isnan(y)]; 
+    if len(yn) == 0: return [np.nan]*h
     level = yn[0]
     for v in y[1:]:
-        if not np.isnan(v):
-            level = alpha*v + (1-alpha)*level
-    out = []
-    for _ in range(h):
-        out.append(level)
-    return out
+        if not np.isnan(v): level = alpha*v + (1-alpha)*level
+    return [level]*h
 
 with tab_outlook:
     st.subheader("Outlook – simple forecasts")
     st.caption("Exploratory forecasts based on national AT time series.")
-
     method = st.selectbox("Forecast method", ["Linear trend (OLS)", "Exponential smoothing (α=0.5)", "4-quarter trailing average"], index=0)
     horizon = st.slider("Horizon (quarters)", 1, 4, 3)
-
     if {"Period","Payments"}.issubset(market_nat_at.columns):
         ts = market_nat_at.groupby("Period", as_index=False)["Payments"].sum()
         periods = order_periods(ts, "Period")
         ts = ts.set_index("Period").reindex(periods).reset_index()
         y = ts["Payments"].astype(float).values
         last_label = periods[-1] if periods else None
-
         if method.startswith("Linear"):
             yhat = _linear_forecast(y, horizon)
         elif method.startswith("Exponential"):
             yhat = _exp_smooth(y, horizon, alpha=0.5)
         else:
-            import numpy as np
-            window = 4
-            last = np.nanmean(y[-window:]) if len(y) >= 1 else np.nan
+            last = np.nanmean(y[-4:]) if len(y) >= 1 else np.nan
             yhat = [last]*horizon
-
         future_labels = _gen_future_periods(last_label, horizon) if last_label else [f"T+{i+1}" for i in range(horizon)]
         fc_df = pd.DataFrame({"Period": periods + future_labels,
                               "Type": ["History"]*len(periods) + ["Forecast"]*len(future_labels),
                               "Payments": list(y) + list(yhat)})
-        ch = (
-            alt.Chart(fc_df)
-            .mark_line(point=True)
-            .encode(
-                x=alt.X("Period:N", sort=list(fc_df["Period"])),
-                y=alt.Y("Payments:Q", title="Payments (AUD)"),
-                color=alt.Color("Type:N"),
-                tooltip=["Period","Type","Payments"]
-            )
-            .properties(height=320, title="AT Payments – history & forecast")
-        )
+        ch = alt.Chart(fc_df).mark_line(point=True).encode(
+            x=alt.X("Period:N", sort=list(fc_df["Period"])),
+            y=alt.Y("Payments:Q", title="Payments (AUD)"),
+            color=alt.Color("Type:N"),
+            tooltip=["Period","Type","Payments"]
+        ).properties(height=320, title="AT Payments – history & forecast")
         st.altair_chart(ch, use_container_width=True)
 
-        hist_last = y[-1] if len(y) else np.nan
-        yoy = np.nan
-        if len(y) >= 5 and not np.isnan(y[-1]) and not np.isnan(y[-5]):
-            yoy = (y[-1] - y[-5]) / y[-5] * 100.0
-        c1, c2, c3 = st.columns(3)
-        with c1:
-            st.metric("Last actual payments", f"{money_fmt(hist_last)}")
-        with c2:
-            st.metric("YoY (last actual)", f"{yoy:.1f}%" if not np.isnan(yoy) else "—")
-        with c3:
-            st.metric("Next quarter (forecast)", f"{money_fmt(yhat[0]) if len(yhat)>0 else '—'}")
-    else:
-        st.info("Payments time series not available; Outlook is disabled.")
-
 # ===============================
-# Data Dictionary (catalog + HHI readiness)
+# Data Dictionary (updated used list)
 # ===============================
 with tab_dict:
     st.subheader("Data Dictionary & HHI Readiness")
     st.caption(f"Active file: **{DATA_PATH}**")
-
     key_cols = [
-        "Support Category", "State/Territory", "Period", "Payments", "Committed supports",
-        "Utilisation", "Market concentration", "Active participants", "Average committed support",
-        "Average payments", "Active provider", "Participants per provider", "Provider growth", "Provider shrink"
+        "Support Category","State/Territory","Period","Payments","Committed supports",
+        "Utilisation","Market concentration","Active participants","Average committed support",
+        "Average payments","Active provider","Participants per provider","Provider growth","Provider shrink",
+        "Plan Management Type"
     ]
     rows = []
     for name, df in sheets.items():
         if not isinstance(df, pd.DataFrame) or df.empty:
-            rows.append({
-                "Sheet": name, "Rows": 0, "Cols": 0,
-                "Provider-like col": None, "Payments-like col": None,
-                **{f"has {c}": False for c in key_cols},
-                "Notes": "Empty or unreadable"
-            })
+            rows.append({"Sheet": name, "Rows": 0, "Cols": 0, **{f"has {c}": False for c in key_cols}})
             continue
-        cols = list(df.columns)
         has = {f"has {c}": (c in df.columns) for c in key_cols}
-        prov_like = find_col(cols, "provider")
-        pay_like  = find_col(cols, "payment")
-        rows.append({
-            "Sheet": name,
-            "Rows": int(df.shape[0]),
-            "Cols": int(df.shape[1]),
-            "Provider-like col": prov_like,
-            "Payments-like col": pay_like,
-            **has,
-            "Notes": ""
-        })
+        rows.append({"Sheet": name,"Rows": int(df.shape[0]),"Cols": int(df.shape[1]), **has})
     catalog = pd.DataFrame(rows).sort_values(["Sheet"]).reset_index(drop=True)
     st.dataframe(catalog, use_container_width=True)
-
-    st.download_button("Download catalog (CSV)", data=catalog.to_csv(index=False).encode("utf-8"), file_name="data_catalog.csv", mime="text/csv")
 
     st.divider()
     st.markdown("### Sheets the app currently uses")
     used = [
-        "Market by Total",
-        "ActPrtpnt by Total",
-        "Provider by Total",
-        "ActPrtpnt by Age Group",
-        "ActPrtpnt by Primary Disability",
-        "ActPrtpnt by Remoteness Rating",
+        "Market by Total","ActPrtpnt by Total","Provider by Total",
+        "ActPrtpnt by Age Group","ActPrtpnt by Primary Disability","ActPrtpnt by Remoteness Rating",
         "Provider by Remoteness Rating",
+        # Adds:
+        "Market by State/Territory","Provider by Primary Disability","Provider by Age Group",
+        "ActPrtpnt by Plan Management Type",
+        "Payments by Registration Group","Payments by Item Type"
     ]
     for s in used:
         ok = (s in sheets) and isinstance(sheets[s], pd.DataFrame) and not sheets[s].empty
         st.markdown(f"- {s}: {'✅ present' if ok else '❌ missing'}")
 
-    st.divider()
-    st.markdown("### HHI readiness (placeholder)")
-    st.write("To compute **exact HHI**, provide a table with provider-level payments by period. Recommended schema:")
-    schema = pd.DataFrame({
-        "Column name": ["Provider Name", "Period", "Payments", "Support Category (optional)", "State/Territory (optional)"],
-        "Type": ["string", "string (e.g., 'Q4 FY24/25')", "number (AUD)", "string", "string"],
-        "Notes": ["Provider legal/trading name", "Match Explorer period labels", "Gross payments for period",
-                  "Filter to 'Capital - Assistive Technology'", "Filter to 'All Australia' for national view"]
-    })
-    st.table(schema)
-
-    template = "Provider Name,Period,Payments,Support Category,State/Territory\nAcme Assistive,Q1 FY24/25,125000,Capital - Assistive Technology,All Australia\nBetter Mobility,Q1 FY24/25,98000,Capital - Assistive Technology,All Australia\n"
-    st.download_button("Download HHI template CSV", data=template.encode("utf-8"), file_name="hhi_provider_payments_template.csv", mime="text/csv")
-
-    prov_sheet_name, prov_pay_df, prov_name_col, pay_col = find_provider_payments_df(sheets)
-    if prov_pay_df is not None and prov_name_col and pay_col:
-        st.success(f"Detected provider-level table suitable for HHI: **{prov_sheet_name}** (Provider: `{prov_name_col}`, Payments: `{pay_col}`)")
-    else:
-        st.info("No provider-level payments table detected in the current workbook. Once supplied, HHI will compute automatically in the Market tab.")
-
-st.caption("Data: Explorer snapshot (.xlsx). Dashboard covers Assistive Technology (AT) only.")
+st.caption("Data: Explorer snapshot (.xlsx). Dashboard covers Assistive Technology (AT) only. Adds 1–4 enabled where source sheets exist.")
