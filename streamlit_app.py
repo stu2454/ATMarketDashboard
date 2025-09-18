@@ -1,10 +1,11 @@
 # streamlit_app.py
 # NDIS AT Market Dashboard (AT-only)
-# Adds 1–4 included:
-# 1) Market by State/Territory (regional trends + optional map placeholder)
+# Adds 1–4 included + robust PPP logic:
+# 1) Market by State/Territory (regional trends)
 # 2) Provider by Primary Disability / Age Group (supply-side cohort cuts)
 # 3) ActPrtpnt by Plan Management Type (mix + utilisation if present)
 # 4) Payments by Registration Group / Item type (Claiming Patterns unlocked)
+# Robust PPP: compute PPP_synth = participants ÷ providers when possible; hide PPP if providers==0.
 
 import os, io
 import streamlit as st
@@ -177,7 +178,7 @@ def is_at(df: pd.DataFrame) -> pd.Series:
     if not isinstance(df, pd.DataFrame) or df.empty:
         return pd.Series([False]*len(df))
     if "Support Category" in df.columns:
-        return df["Support Category"].apply(_is_at_label)
+        return df["Support Category"].apply(lambda v: _is_at_label(v))
     return pd.Series([True]*len(df))
 
 def is_nat(df: pd.DataFrame) -> pd.Series:
@@ -225,7 +226,7 @@ with tab_overview:
     avg_pay    = row_p.get("Average payments", pd.Series([np.nan])).values[0] if not row_p.empty else np.nan
     act_prov   = row_v.get("Active provider", pd.Series([np.nan])).values[0] if not row_v.empty else np.nan
 
-    # computed PPP
+    # PPP (national)
     def _safe(x):
         try: return float(x)
         except Exception: return np.nan
@@ -250,7 +251,7 @@ with tab_overview:
 
     st.divider()
 
-    # Trends & Benchmarks (distinct colours & shapes)
+    # Trends (Payments vs Committed with shapes; dashed roll-avg)
     c1,c2 = st.columns([2,1])
     ts_pay = ts_comm = ts_util = None
     if {"Period","Payments"}.issubset(market_nat_at.columns):
@@ -348,7 +349,7 @@ with tab_participants:
     cohort_view("ActPrtpnt by Remoteness Rating", "Remoteness Rating")
     st.divider()
     # (3) Plan Management Type
-    if not act_by_pmt.empty:
+    if isinstance(act_by_pmt, pd.DataFrame) and not act_by_pmt.empty:
         st.markdown("### Plan Management Type (PMT)")
         df = act_by_pmt.copy()
         if "State/Territory" in df.columns:
@@ -387,72 +388,95 @@ with tab_participants:
             st.info("Plan Management Type sheet present but required columns were not found.")
 
 # ===============================
-# Market (Supply) + Adds (1)(2) + HHI bounds/exact if available
+# Market (Supply) + Adds (1)(2) + Robust PPP + HHI bounds
 # ===============================
 def provider_view_generic(sheet_name, dimension):
-    df = sheets.get(sheet_name)
-    if df is None or df.empty:
+    prov_df = sheets.get(sheet_name)
+    if prov_df is None or prov_df.empty:
         st.warning(f"Sheet '{sheet_name}' not found or empty."); return
-    if {"Support Category","Period"}.issubset(df.columns):
-        df = df[df["Support Category"].apply(lambda v: _is_at_label(v))]
-        if period_select: df = df[df["Period"]==period_select]
-    df = coerce_numeric_columns(df, ["Active provider","Participants per provider","Provider growth","Provider shrink"])
-    grp = df.groupby(dimension, as_index=False).agg({
+
+    # AT-only + selected period
+    if {"Support Category","Period"}.issubset(prov_df.columns):
+        prov_df = prov_df[prov_df["Support Category"].apply(lambda v: _is_at_label(v))]
+        if period_select: prov_df = prov_df[prov_df["Period"]==period_select]
+
+    prov_df = coerce_numeric_columns(
+        prov_df, ["Active provider","Participants per provider","Provider growth","Provider shrink"]
+    )
+
+    # Map provider sheet -> matching participant sheet for synthetic PPP
+    participants_sheet_map = {
+        "Provider by Primary Disability": "ActPrtpnt by Primary Disability",
+        "Provider by Age Group": "ActPrtpnt by Age Group",
+        "Provider by Remoteness Rating": "ActPrtpnt by Remoteness Rating",
+    }
+    p_sheet = participants_sheet_map.get(sheet_name)
+    part_df = sheets.get(p_sheet) if p_sheet else None
+    if isinstance(part_df, pd.DataFrame) and not part_df.empty:
+        if {"Support Category","Period"}.issubset(part_df.columns):
+            part_df = part_df[part_df["Support Category"].apply(lambda v: _is_at_label(v))]
+            if period_select: part_df = part_df[part_df["Period"]==period_select]
+        part_df = coerce_numeric_columns(part_df, ["Active participants"])
+    else:
+        part_df = None
+
+    # Group provider data
+    grp_prov = prov_df.groupby(dimension, as_index=False).agg({
         "Active provider":"sum",
         "Participants per provider":"mean",
         "Provider growth":"sum",
         "Provider shrink":"sum"
-    })
-    c1,c2 = st.columns(2)
+    }).rename(columns={"Participants per provider":"PPP_precomp"})
+
+    # Merge synthetic PPP if possible
+    if part_df is not None and "Active participants" in part_df.columns and dimension in part_df.columns:
+        grp_part = part_df.groupby(dimension, as_index=False)["Active participants"].sum()
+        grp = grp_prov.merge(grp_part, on=dimension, how="left")
+        grp["PPP_synth"] = np.where(
+            (grp["Active provider"] > 0) & (grp["Active participants"].notna()),
+            grp["Active participants"] / grp["Active provider"],
+            np.nan
+        )
+        grp["PPP_final"] = grp["PPP_synth"].fillna(grp["PPP_precomp"])
+    else:
+        grp = grp_prov.copy()
+        grp["Active participants"] = np.nan
+        grp["PPP_synth"] = np.nan
+        grp["PPP_final"] = grp["PPP_precomp"]
+
+    # If providers == 0 (or missing), hide PPP (NaN) instead of showing 0
+    grp.loc[(grp["Active provider"].isna()) | (grp["Active provider"]<=0), "PPP_final"] = np.nan
+
+    c1, c2 = st.columns(2)
     with c1:
         st.altair_chart(
             alt.Chart(grp).mark_bar().encode(
                 x=alt.X("Active provider:Q", title="Active providers"),
                 y=alt.Y(f"{dimension}:N", sort='-x'),
-                tooltip=[dimension,"Active provider","Participants per provider","Provider growth","Provider shrink"]
+                tooltip=[dimension, "Active provider", "Provider growth", "Provider shrink"]
             ).properties(height=350, title=f"Active providers by {dimension}"),
             use_container_width=True
         )
     with c2:
         st.altair_chart(
             alt.Chart(grp).mark_circle(size=120).encode(
-                x=alt.X("Participants per provider:Q"),
+                x=alt.X("PPP_final:Q", title="Participants per provider"),
                 y=alt.Y(f"{dimension}:N", sort='-x'),
-                tooltip=[dimension,"Participants per provider"]
-            ).properties(height=350, title="Participants per provider (mean)"),
+                tooltip=[
+                    dimension,
+                    alt.Tooltip("Active provider:Q", title="Providers"),
+                    alt.Tooltip("Active participants:Q", title="Participants (if available)"),
+                    alt.Tooltip("PPP_precomp:Q", title="PPP (precomputed)"),
+                    alt.Tooltip("PPP_synth:Q", title="PPP (participants/providers)")
+                ]
+            ).properties(height=350, title="Participants per provider (robust)"),
             use_container_width=True
         )
-    st.dataframe(grp)
 
-def find_provider_payments_df(sheets_dict):
-    candidates = []
-    for name, df in sheets_dict.items():
-        if not isinstance(df, pd.DataFrame) or df.empty: continue
-        cols_lower = [str(c).lower() for c in df.columns]
-        if any("provider" in c for c in cols_lower) and any("payment" in c for c in cols_lower):
-            candidates.append((name, df))
-    if not candidates: return None, None, None, None
-    name, df = sorted(candidates, key=lambda x: len(x[1]), reverse=True)[0]
-    provider_col = next((c for c in df.columns if "provider" in str(c).lower()), None)
-    payments_col = next((c for c in df.columns if "payment"  in str(c).lower()), None)
-    return name, df.copy(), provider_col, payments_col if payments_col else None
-
-def compute_hhi_bounds(market_nat_at, prov_nat_at, period_label):
-    if not ({"Period","Market concentration"}.issubset(market_nat_at.columns) and {"Period","Active provider"}.issubset(prov_nat_at.columns)):
-        return None, None
-    t10 = market_nat_at.groupby("Period", as_index=False)["Market concentration"].mean().rename(columns={"Market concentration":"Top10_%"})
-    npr = prov_nat_at.groupby("Period", as_index=False)["Active provider"].sum().rename(columns={"Active provider":"Providers"})
-    bounds = t10.merge(npr, on="Period", how="inner")
-    def hb(row):
-        T = row["Top10_%"]; N = row["Providers"]
-        if pd.isna(T) or pd.isna(N) or N <= 10:
-            return pd.Series({"HHI_min": np.nan, "HHI_max": np.nan})
-        hhi_min = (T**2)/10.0 + ((100.0 - T)**2)/float(N - 10)
-        hhi_max = (T**2) + ((100.0 - T)**2)
-        return pd.Series({"HHI_min": hhi_min, "HHI_max": hhi_max})
-    bounds[["HHI_min","HHI_max"]] = bounds.apply(hb, axis=1)
-    rowb = bounds[bounds["Period"]==period_label].tail(1)
-    return (None if rowb.empty else float(rowb["HHI_min"].values[0])), (None if rowb.empty else float(rowb["HHI_max"].values[0]))
+    st.dataframe(
+        grp[[dimension,"Active provider","Active participants","PPP_precomp","PPP_synth","PPP_final"]]
+        .sort_values("PPP_final", na_position="last", ascending=False)
+    )
 
 with tab_market:
     st.subheader("Provider Market – Supply, Concentration & HHI")
@@ -460,13 +484,13 @@ with tab_market:
     # (2) Supply-side cohort cuts
     cA, cB = st.columns(2)
     with cA:
-        if not prov_by_disability.empty and "Primary Disability" in prov_by_disability.columns:
+        if isinstance(prov_by_disability, pd.DataFrame) and not prov_by_disability.empty and "Primary Disability" in prov_by_disability.columns:
             st.markdown("##### Providers by Primary Disability")
             provider_view_generic("Provider by Primary Disability", "Primary Disability")
         else:
             st.info("Sheet 'Provider by Primary Disability' not found or missing columns.")
     with cB:
-        if not prov_by_age.empty and "Age Group" in prov_by_age.columns:
+        if isinstance(prov_by_age, pd.DataFrame) and not prov_by_age.empty and "Age Group" in prov_by_age.columns:
             st.markdown("##### Providers by Age Group")
             provider_view_generic("Provider by Age Group", "Age Group")
         else:
@@ -474,7 +498,7 @@ with tab_market:
 
     st.divider()
 
-    # Top-10 share tile (national)
+    # Top-10 share (national)
     mc_val = np.nan
     if {"Period","Market concentration"}.issubset(market_nat_at.columns):
         mc_row = market_nat_at[market_nat_at["Period"]==period_select].tail(1)
@@ -485,7 +509,7 @@ with tab_market:
 
     # (1) Regional trends by State/Territory
     st.markdown("#### Regional trends (State/Territory)")
-    if not market_state.empty and {"State/Territory","Period","Payments"}.issubset(market_state.columns):
+    if isinstance(market_state, pd.DataFrame) and not market_state.empty and {"State/Territory","Period","Payments"}.issubset(market_state.columns):
         df = market_state.copy()
         df["State/Territory"] = df["State/Territory"].apply(norm_state)
         df = df[df["Support Category"].apply(lambda v: _is_at_label(v))] if "Support Category" in df.columns else df
@@ -520,20 +544,36 @@ with tab_market:
 
     st.divider()
 
-    # HHI bounds/exact
-    hhi_min, hhi_max = compute_hhi_bounds(market_nat_at, prov_nat_at, period_select)
-    if hhi_min is not None and hhi_max is not None:
-        st.metric("HHI bounds (0–10,000, approx)", f"{hhi_min:,.0f} – {hhi_max:,.0f}",
-                  help="Lower bound: equal shares within Top-10 and among the rest; upper bound: rough maximum.")
+    # HHI bounds (approx; exact requires provider-level payments by period)
+    if {"Period","Market concentration"}.issubset(market_nat_at.columns) and {"Period","Active provider"}.issubset(prov_nat_at.columns):
+        t10 = market_nat_at.groupby("Period", as_index=False)["Market concentration"].mean().rename(columns={"Market concentration":"Top10_%"})
+        npr = prov_nat_at.groupby("Period", as_index=False)["Active provider"].sum().rename(columns={"Active provider":"Providers"})
+        bounds = t10.merge(npr, on="Period", how="inner")
+
+        def hhi_bounds(row):
+            T = row["Top10_%"]; N = row["Providers"]
+            if pd.isna(T) or pd.isna(N) or N <= 10:
+                return pd.Series({"HHI_min": np.nan, "HHI_max": np.nan})
+            hhi_min = (T**2)/10.0 + ((100.0 - T)**2)/float(N - 10)  # percent-squared
+            hhi_max = (T**2) + ((100.0 - T)**2)
+            return pd.Series({"HHI_min": hhi_min, "HHI_max": hhi_max})
+
+        bounds[["HHI_min","HHI_max"]] = bounds.apply(hhi_bounds, axis=1)
+        rowb = bounds[bounds["Period"]==period_select].tail(1)
+        if not rowb.empty and pd.notna(rowb["HHI_min"].values[0]):
+            st.metric("HHI bounds (0–10,000, approx)",
+                      f"{rowb['HHI_min'].values[0]:,.0f} – {rowb['HHI_max'].values[0]:,.0f}",
+                      help="Lower bound assumes equal shares within Top-10 and among the rest; upper bound is a rough maximum.")
+        else:
+            st.metric("HHI bounds (0–10,000, approx)", "—")
     else:
-        st.metric("HHI bounds (0–10,000, approx)", "—", help="Need Top-10% and provider counts.")
+        st.info("Provide Top-10% and provider counts to estimate HHI, or provider-level payments for exact HHI.")
 
 # ===============================
 # Claiming Patterns (4)
 # ===============================
 with tab_claims:
     st.subheader("Claiming Patterns – Registration Groups / Item Types")
-    # Prefer item type if present; else reg group
     df_item = pay_by_item if isinstance(pay_by_item, pd.DataFrame) and not pay_by_item.empty else pd.DataFrame()
     df_reg  = pay_by_reggrp if isinstance(pay_by_reggrp, pd.DataFrame) and not pay_by_reggrp.empty else pd.DataFrame()
     if (not df_item.empty) or (not df_reg.empty):
@@ -542,7 +582,6 @@ with tab_claims:
         df = df_item.copy() if (source=="Item Type" and not df_item.empty) else df_reg.copy()
         if "Support Category" in df.columns:
             df = df[df["Support Category"].apply(lambda v: _is_at_label(v))]
-        # name column
         name_col = next((c for c in df.columns if any(k in str(c).lower() for k in ["item","registration"])), None)
         val_col  = next((c for c in df.columns if "payment" in str(c).lower()), None)
         if not name_col or not val_col:
@@ -582,15 +621,14 @@ with tab_claims:
         st.info("No Registration Group or Item Type payments sheet found. Add one to unlock claiming patterns.")
 
 # ===============================
-# Equity & Regional (kept from previous robust build)
+# Equity & Regional (placeholder note)
 # ===============================
 with tab_equity:
     st.subheader("Equity & Regional Lens (AT)")
-    # First Nations / CALD detection tends to vary a lot by extract; keep interactive mapping from your last build.
     st.info("Use the Data Dictionary to confirm exact equity sheet/column names; parity widgets will populate when those sheets are present in the extract.")
 
 # ===============================
-# Outlook (forecasts) – unchanged
+# Outlook (simple forecasts)
 # ===============================
 def _parse_period(label: str):
     import re
@@ -703,4 +741,4 @@ with tab_dict:
         ok = (s in sheets) and isinstance(sheets[s], pd.DataFrame) and not sheets[s].empty
         st.markdown(f"- {s}: {'✅ present' if ok else '❌ missing'}")
 
-st.caption("Data: Explorer snapshot (.xlsx). Dashboard covers Assistive Technology (AT) only. Adds 1–4 enabled where source sheets exist.")
+st.caption("Data: Explorer snapshot (.xlsx). Dashboard covers Assistive Technology (AT) only. Adds 1–4 enabled where source sheets exist. PPP uses synthetic calc when provider counts are missing/suppressed.")
