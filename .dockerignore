@@ -1,0 +1,16 @@
+# .dockerignore
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.log
+*.sqlite3
+.env
+.venv
+.vscode/
+.ipynb_checkpoints/
+.git/
+.gitignore
+Data/
+data/
+*.xlsx

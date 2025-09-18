@@ -1,0 +1,19 @@
+# docker-compose.yml
+version: "3.9"
+services:
+  at-dashboard:
+    build: .
+    ports:
+      - "8501:8501"
+    environment:
+      # Override if your file has a different name or path
+      - DATA_FILE=/app/data/Explore_Data_2025_09_18.xlsx
+    volumes:
+      # Mount your local Data folder (case sensitive) to /app/data (read-only recommended)
+      - ./Data:/app/data:ro
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8501/_stcore/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
